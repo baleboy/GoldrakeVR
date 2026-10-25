@@ -40,6 +40,10 @@
     <kbd>Space</kbd> jetpack thrusters (hold) &nbsp;·&nbsp; <kbd>R</kbd> rotate robot 90° &nbsp;·&nbsp; <kbd>Esc</kbd> pause<br>
     Land on Goldrake's head or press <kbd>F</kbd> to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject &nbsp;·&nbsp; <kbd>1</kbd> camera
   </div>
+  <div class="keys vr-only" style="display:none">
+    VR: left stick move &nbsp;·&nbsp; right stick turn &nbsp;·&nbsp; trigger thrusters &nbsp;·&nbsp; grip run<br>
+    <kbd>A</kbd> pilot &nbsp;·&nbsp; <kbd>B</kbd> camera &nbsp;·&nbsp; <kbd>Y</kbd> eject &nbsp;·&nbsp; <kbd>X</kbd> rotate robot 90°
+  </div>
   <div class="go">Click to start</div>
 </div>
 <div id="crosshair"></div>
@@ -54,6 +58,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { Sky } from 'three/addons/objects/Sky.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
 
 // ---------- constants ----------
 const ROBOT_HEIGHT = 30;      // meters
@@ -76,9 +81,17 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.55;
 document.body.appendChild(renderer.domElement);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local');   // origin at the headset, so the rig marks the eye point
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 6000);
+// In VR the headset owns the camera's local pose, so the game moves this rig instead
+// (see syncRig). On a flat screen the rig stays at the origin and is a no-op.
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+const inVR = () => renderer.xr.isPresenting;
 
 // Sky + sun
 const sky = new Sky();
@@ -334,6 +347,7 @@ Promise.all([loadGLB('goldrake_anim.glb'), loadGLB('goldrake.glb')]).then(([gltf
   updateRobotBox();
   document.getElementById('loading').remove();
   overlay.style.display = 'flex';
+  showVRButton();
 }).catch((err) => {
   document.getElementById('loading').textContent = 'Failed to load Goldrake models — serve this folder over HTTP, e.g. python3 -m http.server.';
   console.error(err);
@@ -352,19 +366,64 @@ const controls = new PointerLockControls(camera, document.body);
 const overlay = document.getElementById('overlay');
 overlay.addEventListener('click', () => { controls.lock(); audio.init(); });
 controls.addEventListener('lock', () => overlay.style.display = 'none');
-controls.addEventListener('unlock', () => overlay.style.display = 'flex');
+controls.addEventListener('unlock', () => { if (!inVR()) overlay.style.display = 'flex'; });
 
 const keys = {};
 addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
   if (!controls.isLocked || e.repeat) return;
-  if (e.code === 'KeyR' && !piloting) { robotPivot.rotation.y += Math.PI / 2; updateRobotBox(); }
-  if (e.code === 'KeyE' && piloting) eject();
-  if (e.code === 'KeyF' && !piloting) enterRobot();   // board directly, no need to fly up
-  if (e.code === 'Digit1' && piloting) setCamMode((camMode + 1) % CAM_MODES.length);
+  if (e.code === 'KeyR') actions.rotate();
+  if (e.code === 'KeyE') actions.eject();
+  if (e.code === 'KeyF') actions.board();
+  if (e.code === 'Digit1') actions.camera();
 });
 addEventListener('keyup', (e) => keys[e.code] = false);
+
+// One-shot actions shared by keyboard and VR controllers
+const actions = {
+  rotate() { if (!piloting) { robotPivot.rotation.y += Math.PI / 2; updateRobotBox(); } },
+  eject() { if (piloting) eject(); },
+  board() { if (!piloting) enterRobot(); },   // board directly, no need to fly up
+  camera() { if (piloting) setCamMode((camMode + 1) % CAM_MODES.length); },
+};
+
+// ---------- VR controllers (xr-standard gamepad mapping) ----------
+// Left stick moves, right stick snap-turns (and tilts orbit cams), trigger fires
+// the thrusters, grip runs; A pilot, B camera, Y eject, X rotate robot.
+const vr = { moveX: 0, moveY: 0, thrust: false, run: false, prev: {}, turnArmed: true };
+const VR_SNAP = Math.PI / 6;
+function pollVR(dt) {
+  vr.moveX = vr.moveY = 0; vr.thrust = vr.run = false;
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  const pressed = {};
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const h = src.handedness, b = (i) => !!gp.buttons[i]?.pressed;
+    const sx = gp.axes[2] ?? gp.axes[0] ?? 0, sy = gp.axes[3] ?? gp.axes[1] ?? 0;
+    const dz = (v) => Math.abs(v) < 0.15 ? 0 : v;
+    if (b(1)) vr.run = true;
+    if (h === 'left') {
+      vr.moveX = dz(sx); vr.moveY = dz(sy);
+      pressed.X = b(4); pressed.Y = b(5);
+    } else if (h === 'right') {
+      if (b(0)) vr.thrust = true;
+      pressed.A = b(4); pressed.B = b(5);
+      // Snap turn: one step per flick, re-armed once the stick returns to centre
+      if (vr.turnArmed && Math.abs(sx) > 0.7) { look(Math.sign(sx) * VR_SNAP, 0); vr.turnArmed = false; }
+      else if (Math.abs(sx) < 0.3) vr.turnArmed = true;
+      if (piloting && !cam().cockpit) look(0, dz(sy) * 1.2 * dt);
+    }
+  }
+  const edge = (k) => pressed[k] && !vr.prev[k];
+  if (edge('A')) actions.board();
+  if (edge('B')) actions.camera();
+  if (edge('Y')) actions.eject();
+  if (edge('X')) actions.rotate();
+  vr.prev = pressed;
+}
 
 // Pilot camera modes. Orbit modes circle a point `pivotY` above the robot's
 // (lagging) position at `dist`/`pitch`, offset sideways by `shoulder`, and aim
@@ -390,6 +449,7 @@ function setCamMode(i) {
   orbit.yaw = robot.heading + Math.PI;
   cockpitLook.yaw = 0; cockpitLook.pitch = -0.15;
   chase.focus.copy(robotPivot.position);
+  chase.eyeY = null;
   camera.near = cam().near;
   camera.updateProjectionMatrix();
   flash(cam().name);
@@ -397,7 +457,9 @@ function setCamMode(i) {
 
 // Turn the view by (dx, dy) radians the way the mouse does: dx > 0 looks right, dy > 0 looks down
 const lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+let vrYaw = 0;                                   // on-foot body yaw while in VR
 function look(dx, dy) {
+  if (!piloting && inVR()) { vrYaw -= dx; return; }   // the headset handles pitch
   if (!piloting) {
     // on foot PointerLockControls owns the mouse; mirror its first-person rotation
     lookEuler.setFromQuaternion(camera.quaternion);
@@ -548,6 +610,7 @@ function readWish() {
   if (keys.KeyS) wish.sub(fwd);
   if (keys.KeyD) wish.add(right);
   if (keys.KeyA) wish.sub(right);
+  wish.addScaledVector(fwd, -vr.moveY).addScaledVector(right, vr.moveX);
   if (wish.lengthSq() > 0) wish.normalize();
   return wish;
 }
@@ -591,7 +654,7 @@ function updateDust(dt) {
 // Chase camera state: lagging focus point plus a damped spring for footstep sway
 const FOOT_FOV = 70;
 const camEuler = new THREE.Euler(0, 0, 0, 'YXZ');
-const chase = { focus: new THREE.Vector3(), bob: 0, bobVel: 0, roll: 0, rollVel: 0, kicks: [] };
+const chase = { focus: new THREE.Vector3(), bob: 0, bobVel: 0, roll: 0, rollVel: 0, kicks: [], eyeY: null, target: new THREE.Vector3() };
 
 function footfall(foot, b) {
   audio.thud(0.4 + 0.35 * b);
@@ -677,11 +740,12 @@ function eject() {
   fuel = 1; onGround = false; reenterCooldown = 4;
   camera.position.set(feet.x, feet.y + EYE_HEIGHT, feet.z);
   camera.lookAt(camera.position.x - back.x * 10, camera.position.y, camera.position.z - back.z * 10);
+  vrYaw = robot.heading + Math.PI;            // same facing for the VR rig
   flash('EJECT!');
 }
 
 function updatePilot(dt) {
-  const running = keys.ShiftLeft || keys.ShiftRight;
+  const running = keys.ShiftLeft || keys.ShiftRight || vr.run;
   updateRobot(dt, readWish(), running);
 
   const m = cam();
@@ -695,18 +759,24 @@ function updatePilot(dt) {
   }
   chase.bobVel += (-40 * chase.bob - 6 * chase.bobVel) * dt; chase.bob += chase.bobVel * dt;
   chase.rollVel += (-30 * chase.roll - 5 * chase.rollVel) * dt; chase.roll += chase.rollVel * dt;
+  // Camera-driven sway and roll are a fast track to motion sickness in a headset
+  if (inVR()) chase.bob = chase.bobVel = chase.roll = chase.rollVel = 0;
 
   if (m.cockpit) {
     // Eye at the front of the head; the mocap head motion supplies the gait bob
     anim.eye.getWorldPosition(camera.position);
     camera.position.y += chase.bob * 0.3;
+    if (inVR()) {                             // ...softened in VR
+      chase.eyeY = chase.eyeY === null ? camera.position.y : THREE.MathUtils.damp(chase.eyeY, camera.position.y, 3, dt);
+      camera.position.y = chase.eyeY;
+    }
     camEuler.set(cockpitLook.pitch, robot.heading + Math.PI + cockpitLook.yaw, chase.roll * 0.5);
     camera.quaternion.setFromEuler(camEuler);
   } else {
     // Drift the camera back behind the robot while it walks roughly away from us
     const behind = robot.heading + Math.PI;
     const off = Math.atan2(Math.sin(behind - orbit.yaw), Math.cos(behind - orbit.yaw));
-    const straight = keys.KeyW && !keys.KeyA && !keys.KeyD;
+    const straight = (keys.KeyW && !keys.KeyA && !keys.KeyD) || (vr.moveY < -0.5 && Math.abs(vr.moveX) < 0.3);
     if (straight && robot.speed > 0.5 && Math.abs(off) < Math.PI / 3) orbit.yaw += off * Math.min(1, 1.5 * dt);
 
     // The focus point lags behind the robot so the camera feels heavy
@@ -722,7 +792,8 @@ function updatePilot(dt) {
       f.x + sy * cp * m.dist + rx * m.shoulder,
       Math.max(1.5, m.pivotY + Math.sin(m.pitch) * m.dist + chase.bob),
       f.z + cy * cp * m.dist + rz * m.shoulder);
-    camera.lookAt(f.x + rx * m.aim, m.targetY + chase.bob * 0.5, f.z + rz * m.aim);
+    chase.target.set(f.x + rx * m.aim, m.targetY + chase.bob * 0.5, f.z + rz * m.aim);
+    camera.lookAt(chase.target);
     camera.rotateZ(chase.roll);
   }
 
@@ -736,11 +807,11 @@ function updateOnFoot(dt) {
   updateRobot(dt, NO_INPUT, false);   // let the robot settle to rest
   readWish();
 
-  const thrusting = keys.Space && fuel > 0;
+  const thrusting = (keys.Space || vr.thrust) && fuel > 0;
   audio.set(thrusting);
 
   if (onGround && !thrusting) {
-    const sp = keys.ShiftLeft || keys.ShiftRight ? RUN : WALK;
+    const sp = keys.ShiftLeft || keys.ShiftRight || vr.run ? RUN : WALK;
     vel.x = THREE.MathUtils.damp(vel.x, wish.x * sp, 12, dt);
     vel.z = THREE.MathUtils.damp(vel.z, wish.z * sp, 12, dt);
   } else {
@@ -791,7 +862,7 @@ function updateOnFoot(dt) {
   feet.z = THREE.MathUtils.clamp(feet.z, -lim, lim);
 
   camera.position.set(feet.x, feet.y + EYE_HEIGHT, feet.z);
-  if (shake > 0) {
+  if (shake > 0 && !inVR()) {
     const k = 0.03 * shake;
     camera.position.x += (Math.random() - 0.5) * k;
     camera.position.y += (Math.random() - 0.5) * k;
@@ -805,14 +876,52 @@ function updateOnFoot(dt) {
   if (msgTimer > 0 && (msgTimer -= dt) <= 0) hud.msg.style.opacity = 0;
 }
 
+// In VR, hand the game's chosen eye point and heading to the rig; the headset
+// supplies pitch, roll and head movement on top.
+// (Yaw is derived directly: camera.lookAt is wrong once the rig is moved.)
+function syncRig() {
+  const p = camera.position, t = chase.target;
+  let yaw = vrYaw;
+  if (piloting) yaw = cam().cockpit ? robot.heading + Math.PI + cockpitLook.yaw : Math.atan2(p.x - t.x, p.z - t.z);
+  rig.position.copy(p);
+  rig.rotation.set(0, yaw, 0);
+}
+
+function showVRButton() {
+  navigator.xr?.isSessionSupported('immersive-vr').then((ok) => {
+    if (!ok) return;
+    const button = VRButton.createButton(renderer);
+    button.addEventListener('click', () => audio.init());
+    document.body.appendChild(button);
+    document.querySelector('.vr-only').style.display = '';
+  });
+}
+renderer.xr.addEventListener('sessionstart', () => {
+  lookEuler.setFromQuaternion(camera.quaternion);
+  vrYaw = lookEuler.y;
+  chase.eyeY = null;
+  controls.unlock();
+  overlay.style.display = 'none';
+});
+renderer.xr.addEventListener('sessionend', () => {
+  rig.position.set(0, 0, 0);
+  rig.rotation.set(0, 0, 0);
+  camera.quaternion.setFromEuler(lookEuler.set(0, vrYaw, 0));
+  camera.fov = piloting ? cam().fov : FOOT_FOV;
+  camera.updateProjectionMatrix();
+  overlay.style.display = 'flex';
+});
+
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
-  if (controls.isLocked) { arrowLook(dt); (piloting ? updatePilot : updateOnFoot)(dt); }
+  if (inVR()) { pollVR(dt); (piloting ? updatePilot : updateOnFoot)(dt); syncRig(); }
+  else if (controls.isLocked) { arrowLook(dt); (piloting ? updatePilot : updateOnFoot)(dt); }
   else audio.set(false);
   updateDust(dt);
   // Narrow lens while piloting flattens perspective, like filming something huge from afar
+  // (the headset fixes its own field of view)
   const fov = piloting ? cam().fov : FOOT_FOV;
-  if (Math.abs(camera.fov - fov) > 0.01) {
+  if (!inVR() && Math.abs(camera.fov - fov) > 0.01) {
     camera.fov = THREE.MathUtils.damp(camera.fov, fov, 3, dt);
     camera.updateProjectionMatrix();
   }
