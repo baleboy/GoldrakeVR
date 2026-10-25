@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goldrake 1:1</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: ui-monospace, Menlo, monospace; color: #fff; }
+  canvas { display: block; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(5, 10, 20, 0.72); cursor: pointer; text-align: center; gap: 14px; user-select: none;
+  }
+  #overlay h1 { margin: 0; font-size: 44px; letter-spacing: 6px; color: #ffcf3a; text-shadow: 0 0 18px #ff7a00; }
+  #overlay .keys { line-height: 1.8; font-size: 15px; opacity: .9; }
+  #overlay kbd { border: 1px solid #fff8; border-radius: 4px; padding: 1px 7px; background: #fff1; }
+  #overlay .go { margin-top: 10px; font-size: 18px; color: #7fd4ff; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 18px; }
+  #hud { position: fixed; left: 20px; bottom: 20px; font-size: 14px; line-height: 1.6; text-shadow: 0 1px 3px #000; pointer-events: none; }
+  #fuel { width: 180px; height: 10px; border: 1px solid #fffa; margin-top: 4px; }
+  #fuelbar { height: 100%; width: 100%; background: linear-gradient(90deg, #ff5a00, #ffd23a); }
+  #msg { position: fixed; top: 22%; width: 100%; text-align: center; font-size: 28px; color: #ff6040; text-shadow: 0 0 10px #000; opacity: 0; transition: opacity .4s; pointer-events: none; }
+  body.piloting #crosshair { display: none; }
+  #crosshair { position: fixed; top: 50%; left: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: #fff9; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="loading">Loading Goldrake… <span id="pct">0%</span></div>
+<div id="overlay" style="display:none">
+  <h1>GOLDRAKE 1:1</h1>
+  <div class="keys">
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &nbsp;·&nbsp; <kbd>Mouse</kbd> look &nbsp;·&nbsp; <kbd>Shift</kbd> run<br>
+    <kbd>Space</kbd> jetpack thrusters (hold) &nbsp;·&nbsp; <kbd>R</kbd> rotate robot 90° &nbsp;·&nbsp; <kbd>Esc</kbd> pause<br>
+    Land on Goldrake's head to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject
+  </div>
+  <div class="go">Click to start</div>
+</div>
+<div id="crosshair"></div>
+<div id="hud">
+  <div>ALT <span id="alt">0.0</span> m &nbsp; V/S <span id="vs">0.0</span> m/s &nbsp; SPD <span id="spd">0.0</span> m/s</div>
+  <div>FUEL <div id="fuel"><div id="fuelbar"></div></div></div>
+</div>
+<div id="msg"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+// ---------- constants ----------
+const ROBOT_HEIGHT = 30;      // meters
+const EYE_HEIGHT = 1.7;
+const GRAVITY = 9.81;
+const THRUST = 17;            // m/s^2 upward while thrusting (net ≈ +7)
+const WALK = 5, RUN = 11;     // ground speeds
+const AIR_ACCEL = 6;          // horizontal accel while airborne
+const AIR_DRAG = 0.25;        // per-second horizontal drag in air
+const FUEL_BURN = 0.09;       // fraction per second
+const FUEL_REFILL = 0.35;     // fraction per second on ground
+const PLAYER_RADIUS = 0.5;
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.55;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 6000);
+
+// Sky + sun
+const sky = new Sky();
+sky.scale.setScalar(10000);
+const su = sky.material.uniforms;
+su.turbidity.value = 6; su.rayleigh.value = 1.6; su.mieCoefficient.value = 0.005; su.mieDirectionalG.value = 0.8;
+const sunDir = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(58), THREE.MathUtils.degToRad(35));
+su.sunPosition.value.copy(sunDir);
+scene.add(sky);
+
+// Environment map from the sky for PBR reflections
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envScene = new THREE.Scene();
+envScene.add(sky.clone());
+scene.environment = pmrem.fromScene(envScene).texture;
+scene.environmentIntensity = 0.6;
+scene.fog = new THREE.Fog(0xb9cbe0, 300, 2500);
+
+const hemi = new THREE.HemisphereLight(0xcfe4ff, 0x6b5a45, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff1dc, 3.2);
+sun.position.copy(sunDir).multiplyScalar(120);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 300 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.04;
+scene.add(sun, sun.target);
+
+// ---------- ground ----------
+function makeGroundTexture() {
+  const s = 1024, c = document.createElement('canvas');
+  c.width = c.height = s;
+  const g = c.getContext('2d');
+  g.fillStyle = '#6f6b63'; g.fillRect(0, 0, s, s);
+  const img = g.getImageData(0, 0, s, s), d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const n = (Math.random() - 0.5) * 26;
+    d[i] += n; d[i + 1] += n; d[i + 2] += n;
+  }
+  g.putImageData(img, 0, 0);
+  // concrete slab seams every 1/4 of the tile (tile = 20 m → 5 m slabs)
+  g.strokeStyle = 'rgba(30,28,25,0.55)'; g.lineWidth = 3;
+  for (let k = 0; k <= 4; k++) {
+    const p = k * s / 4;
+    g.beginPath(); g.moveTo(p, 0); g.lineTo(p, s); g.stroke();
+    g.beginPath(); g.moveTo(0, p); g.lineTo(s, p); g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+const GROUND_SIZE = 6000;
+const groundTex = makeGroundTexture();
+groundTex.repeat.set(GROUND_SIZE / 20, GROUND_SIZE / 20);
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE),
+  new THREE.MeshStandardMaterial({ map: groundTex, roughness: 0.95, metalness: 0 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Scale references: human-sized figures (1.8 m) and a few cars near the robot
+const refMat = new THREE.MeshStandardMaterial({ color: 0x2b5cff, roughness: 0.6 });
+const human = new THREE.CapsuleGeometry(0.25, 1.3, 4, 12);
+[[-6, 10], [7, 12], [3, 16], [-12, -4]].forEach(([x, z]) => {
+  const m = new THREE.Mesh(human, refMat);
+  m.position.set(x, 0.9, z); m.castShadow = true; scene.add(m);
+});
+const carGeo = new THREE.BoxGeometry(1.8, 1.4, 4.4);
+[[14, 6, 0xc0392b, 0.3], [-16, 14, 0xeeeeee, -0.6], [18, -12, 0x27ae60, 1.2]].forEach(([x, z, col, r]) => {
+  const m = new THREE.Mesh(carGeo, new THREE.MeshStandardMaterial({ color: col, roughness: 0.35, metalness: 0.5 }));
+  m.position.set(x, 0.7, z); m.rotation.y = r; m.castShadow = m.receiveShadow = true; scene.add(m);
+});
+
+// Distant mountains ring for a horizon
+{
+  const geo = new THREE.CylinderGeometry(2200, 2200, 1, 256, 1, true);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    if (pos.getY(i) > 0) {
+      const a = Math.atan2(pos.getZ(i), pos.getX(i));
+      const h = 90 + 70 * Math.sin(a * 7) + 45 * Math.sin(a * 17 + 1) + 25 * Math.sin(a * 41 + 2);
+      pos.setY(i, Math.max(20, h));
+    } else pos.setY(i, -5);
+  }
+  geo.computeVertexNormals();
+  const mtn = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x55606e, roughness: 1, side: THREE.BackSide }));
+  scene.add(mtn);
+}
+
+// ---------- robot ----------
+const robotPivot = new THREE.Group();   // robot faces +Z in pivot space
+scene.add(robotPivot);
+let robotMesh = null;                   // static rest-pose collider (raycasting a skinned mesh is too slow)
+let mixer = null;
+const anim = { walk: null, run: null, ready: false };
+const robotBox = new THREE.Box3();
+
+// Sample a clip to find how fast the planted foot moves backwards (= ground
+// speed with no foot sliding) and at which phase each foot strikes the ground.
+function calibrate(action, feetBones) {
+  const dur = action.getClip().duration, N = 64, v = new THREE.Vector3();
+  action.setEffectiveWeight(1);
+  const zs = feetBones.map(() => []);
+  for (let k = 0; k < N; k++) {
+    action.time = k / N * dur;
+    mixer.update(0);
+    robotPivot.updateMatrixWorld(true);
+    feetBones.forEach((b, i) => zs[i].push(robotPivot.worldToLocal(b.getWorldPosition(v)).z));
+  }
+  action.setEffectiveWeight(0);
+  let travel = 0;
+  const strikes = zs.map((z) => {
+    travel += Math.max(...z) - Math.min(...z);
+    return z.indexOf(Math.max(...z)) / N;      // heel strike ≈ foot furthest forward
+  });
+  return { dur, speed: travel / dur, strikes };
+}
+
+// goldrake_anim.glb carries the rig and clips; goldrake.glb shares its UV layout
+// but has the proper baked colour + metal/roughness maps, so we borrow its material.
+const loadProgress = {};
+const loadGLB = (url) => new GLTFLoader().loadAsync(url, (e) => {
+  loadProgress[url] = e;
+  const all = Object.values(loadProgress), total = all.reduce((t, p) => t + p.total, 0);
+  if (total && all.length === 2) document.getElementById('pct').textContent = Math.round(all.reduce((t, p) => t + p.loaded, 0) / total * 100) + '%';
+});
+Promise.all([loadGLB('goldrake_anim.glb'), loadGLB('goldrake.glb')]).then(([gltf, orig]) => {
+  const model = gltf.scene;
+  let skinned = null;
+  model.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model, true);
+  const s = ROBOT_HEIGHT / box.getSize(new THREE.Vector3()).y;
+  model.scale.multiplyScalar(s);
+  const center = box.getCenter(new THREE.Vector3());
+  model.position.set(-center.x * s, -box.min.y * s, -center.z * s);
+  robotPivot.add(model);
+  robotPivot.updateMatrixWorld(true);
+
+  skinned.castShadow = skinned.receiveShadow = true;
+  skinned.frustumCulled = false;
+  let mat = null;
+  orig.scene.traverse((o) => { if (o.isMesh) mat = o.material; });
+  skinned.material.dispose();
+  skinned.material = mat;
+  for (const t of [mat.map, mat.metalnessMap]) if (t) t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+  // Bake the rest pose into a plain mesh for collisions
+  const geo = new THREE.BufferGeometry();
+  const src = skinned.geometry, pos = new Float32Array(src.attributes.position.count * 3), v = new THREE.Vector3();
+  for (let i = 0; i < src.attributes.position.count; i++) skinned.getVertexPosition(i, v).toArray(pos, i * 3);
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(src.index);
+  geo.computeBoundingBox(); geo.computeBoundingSphere();
+  robotMesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+  robotMesh.matrixAutoUpdate = false;
+  const colliderLocal = new THREE.Matrix4().copy(robotPivot.matrixWorld).invert().multiply(skinned.matrixWorld);
+  robotMesh.userData.local = colliderLocal;
+
+  mixer = new THREE.AnimationMixer(model);
+  for (const c of gltf.animations) {
+    if (/walk/i.test(c.name)) anim.walk = mixer.clipAction(c);
+    if (/run/i.test(c.name)) anim.run = mixer.clipAction(c);
+  }
+  if (anim.walk && anim.run) {
+    for (const a of [anim.walk, anim.run]) { a.play(); a.setEffectiveWeight(0); }
+    const bone = (suffix) => { let f = null; model.traverse((o) => { if (o.isBone && o.name.endsWith(suffix)) f = o; }); return f; };
+    const feetBones = [bone('LeftFoot'), bone('RightFoot')];
+    anim.walkCal = calibrate(anim.walk, feetBones);
+    anim.runCal = calibrate(anim.run, feetBones);
+    mixer.update(0);
+    anim.ready = true;
+  }
+
+  updateRobotBox();
+  document.getElementById('loading').remove();
+  overlay.style.display = 'flex';
+}).catch((err) => {
+  document.getElementById('loading').textContent = 'Failed to load Goldrake models — serve this folder over HTTP, e.g. python3 -m http.server.';
+  console.error(err);
+});
+
+function updateRobotBox() {
+  robotPivot.updateMatrixWorld(true);
+  if (!robotMesh) return;
+  robotMesh.matrix.multiplyMatrices(robotPivot.matrixWorld, robotMesh.userData.local);
+  robotMesh.matrixWorld.copy(robotMesh.matrix);
+  robotBox.copy(robotMesh.geometry.boundingBox).applyMatrix4(robotMesh.matrixWorld).expandByScalar(PLAYER_RADIUS + 0.5);
+}
+
+// ---------- controls ----------
+const controls = new PointerLockControls(camera, document.body);
+const overlay = document.getElementById('overlay');
+overlay.addEventListener('click', () => { controls.lock(); audio.init(); });
+controls.addEventListener('lock', () => overlay.style.display = 'none');
+controls.addEventListener('unlock', () => overlay.style.display = 'flex');
+
+const keys = {};
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (!controls.isLocked || e.repeat) return;
+  if (e.code === 'KeyR' && !piloting) { robotPivot.rotation.y += Math.PI / 2; updateRobotBox(); }
+  if (e.code === 'KeyE' && piloting) eject();
+});
+addEventListener('keyup', (e) => keys[e.code] = false);
+
+// Third-person orbit while piloting (PointerLockControls' own rotation is overwritten each frame)
+const orbit = { yaw: Math.PI, pitch: 0.28, dist: 58 };
+addEventListener('mousemove', (e) => {
+  if (!piloting || !controls.isLocked) return;
+  orbit.yaw -= e.movementX * 0.003;
+  orbit.pitch = THREE.MathUtils.clamp(orbit.pitch + e.movementY * 0.003, 0.02, 1.2);
+});
+
+// Player state: `feet` is the position of the player's feet
+const feet = new THREE.Vector3(0, 0, 40);
+const vel = new THREE.Vector3();
+let fuel = 1, onGround = true;
+let piloting = false, reenterCooldown = 0;
+camera.position.set(feet.x, feet.y + EYE_HEIGHT, feet.z);
+camera.lookAt(0, 14, 0);
+
+// ---------- collisions against the robot mesh ----------
+const ray = new THREE.Raycaster();
+const DOWN = new THREE.Vector3(0, -1, 0);
+const tmp = new THREE.Vector3();
+
+function nearRobot(p) {
+  return robotMesh && robotBox.containsPoint(p);
+}
+
+// Height of the surface under the player (robot or ground).
+function surfaceHeight(p) {
+  let h = 0;
+  if (nearRobot(p)) {
+    ray.set(tmp.set(p.x, p.y + 1.2, p.z), DOWN);
+    ray.far = p.y + 2;
+    const hit = ray.intersectObject(robotMesh, false)[0];
+    if (hit) h = Math.max(h, hit.point.y);
+  }
+  return h;
+}
+
+// Stop horizontal movement into the robot; rays at knee, chest and head height.
+function blockHorizontal(p, move) {
+  const len = move.length();
+  if (len < 1e-6 || !nearRobot(p)) return move;
+  const dir = tmp.copy(move).divideScalar(len);
+  for (const hgt of [0.6, 1.2, 1.8]) {
+    ray.set(new THREE.Vector3(p.x, p.y + hgt, p.z), dir);
+    ray.far = len + PLAYER_RADIUS;
+    const hit = ray.intersectObject(robotMesh, false)[0];
+    if (hit) {
+      // slide along the surface
+      const n = hit.face.normal.clone().transformDirection(robotMesh.matrixWorld);
+      n.y = 0; if (n.lengthSq() < 1e-6) return move.set(0, 0, 0);
+      n.normalize();
+      if (n.dot(dir) > 0) n.negate(); // double-sided mesh: make normal face the player
+      const into = move.dot(n);
+      if (into < 0) move.addScaledVector(n, -into);
+      return move;
+    }
+  }
+  return move;
+}
+
+// ---------- thruster audio (filtered noise) ----------
+const audio = {
+  ctx: null, gain: null,
+  init() {
+    if (this.ctx) return;
+    const ctx = this.ctx = new AudioContext();
+    const buf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const filt = ctx.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 700;
+    this.gain = ctx.createGain(); this.gain.gain.value = 0;
+    src.connect(filt).connect(this.gain).connect(ctx.destination);
+    src.start();
+  },
+  set(on) {
+    if (this.gain) this.gain.gain.setTargetAtTime(on ? 0.25 : 0, this.ctx.currentTime, 0.08);
+  },
+  // Low boom for giant footsteps
+  thud(vol) {
+    if (!this.ctx) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const osc = ctx.createOscillator(), g = ctx.createGain();
+    osc.frequency.setValueAtTime(70, t);
+    osc.frequency.exponentialRampToValueAtTime(28, t + 0.5);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+    osc.connect(g).connect(ctx.destination);
+    osc.start(t); osc.stop(t + 1);
+  }
+};
+
+// ---------- HUD ----------
+const $ = (id) => document.getElementById(id);
+const hud = { alt: $('alt'), vs: $('vs'), spd: $('spd'), fuel: $('fuelbar'), msg: $('msg') };
+let msgTimer = 0;
+function flash(text) { hud.msg.textContent = text; hud.msg.style.opacity = 1; msgTimer = 1.6; }
+
+// ---------- main loop ----------
+const clock = new THREE.Clock();
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), wish = new THREE.Vector3(), move = new THREE.Vector3();
+let shake = 0;
+
+// WASD → horizontal direction relative to the camera's view
+function readWish() {
+  camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+  right.crossVectors(fwd, camera.up).normalize();
+  wish.set(0, 0, 0);
+  if (keys.KeyW) wish.add(fwd);
+  if (keys.KeyS) wish.sub(fwd);
+  if (keys.KeyD) wish.add(right);
+  if (keys.KeyA) wish.sub(right);
+  if (wish.lengthSq() > 0) wish.normalize();
+  return wish;
+}
+
+// ---------- robot locomotion ----------
+const TURN_RATE = 1.1;                        // rad/s
+const ANIM_SPEED = 0.55;                      // mocap is human cadence; slow it so 30 m feels heavy
+const robot = { heading: 0, level: 0, phase: 0, speed: 0 };
+const NO_INPUT = new THREE.Vector3();
+
+// level: 0 = idle (rest pose), 1 = walk, 2 = run (smoothed). Both clips share one
+// normalised phase so walk↔run blends stay in step; ground speed comes from the
+// calibrated foot travel so the planted foot doesn't slide.
+function updateRobot(dt, input, running) {
+  if (!anim.ready) return;
+  const moving = input.lengthSq() > 0;
+  robot.level = THREE.MathUtils.damp(robot.level, moving ? (running ? 2 : 1) : 0, 2.5, dt);
+  if (robot.level < 1e-3) robot.level = 0;
+
+  const w = Math.min(robot.level, 1);                       // walk/run vs rest pose
+  const b = THREE.MathUtils.clamp(robot.level - 1, 0, 1);   // run vs walk
+  const { walkCal, runCal } = anim;
+  const freq = ANIM_SPEED * THREE.MathUtils.lerp(1 / walkCal.dur, 1 / runCal.dur, b);
+  let speed = ANIM_SPEED * w * THREE.MathUtils.lerp(walkCal.speed, runCal.speed, b);
+
+  if (moving) {
+    const target = Math.atan2(input.x, input.z);
+    const diff = Math.atan2(Math.sin(target - robot.heading), Math.cos(target - robot.heading));
+    robot.heading += THREE.MathUtils.clamp(diff, -TURN_RATE * dt, TURN_RATE * dt);
+    speed *= Math.max(0, Math.cos(diff));     // mostly turn in place before striding off
+  }
+  robot.speed = speed;
+  robotPivot.rotation.y = robot.heading;
+  robotPivot.position.x += Math.sin(robot.heading) * speed * dt;
+  robotPivot.position.z += Math.cos(robot.heading) * speed * dt;
+  const lim = GROUND_SIZE / 2 - 300;
+  robotPivot.position.x = THREE.MathUtils.clamp(robotPivot.position.x, -lim, lim);
+  robotPivot.position.z = THREE.MathUtils.clamp(robotPivot.position.z, -lim, lim);
+
+  const prev = robot.phase;
+  if (w > 0) robot.phase = (robot.phase + freq * dt) % 1;
+  anim.walk.setEffectiveWeight(w * (1 - b));
+  anim.run.setEffectiveWeight(w * b);
+  anim.walk.time = robot.phase * walkCal.dur;
+  anim.run.time = robot.phase * runCal.dur;
+  mixer.update(0);
+
+  // Footfalls
+  const strikes = (b > 0.5 ? runCal : walkCal).strikes;
+  const crossed = (t) => prev < robot.phase ? prev < t && t <= robot.phase : t > prev || t <= robot.phase;
+  if (w > 0.5 && prev !== robot.phase && strikes.some(crossed)) {
+    audio.thud(0.35 + 0.35 * b);
+    shake = Math.max(shake, 0.5 + 0.4 * b);
+  }
+  if (!piloting && robot.level > 0) updateRobotBox();
+}
+
+function enterRobot() {
+  piloting = true;
+  robot.heading = robotPivot.rotation.y;
+  orbit.yaw = robot.heading + Math.PI;
+  orbit.pitch = 0.28;
+  vel.set(0, 0, 0);
+  audio.set(false);
+  document.body.classList.add('piloting');
+  flash('PILOT MODE — WASD walk · Shift run · E eject');
+}
+
+function eject() {
+  piloting = false;
+  document.body.classList.remove('piloting');
+  updateRobotBox();
+  const back = new THREE.Vector3(-Math.sin(robot.heading), 0, -Math.cos(robot.heading));
+  feet.copy(robotPivot.position).addScaledVector(back, 2);
+  feet.y = ROBOT_HEIGHT + 1;
+  vel.copy(back).multiplyScalar(6); vel.y = 14;
+  fuel = 1; onGround = false; reenterCooldown = 4;
+  camera.position.set(feet.x, feet.y + EYE_HEIGHT, feet.z);
+  camera.lookAt(camera.position.x - back.x * 10, camera.position.y, camera.position.z - back.z * 10);
+  flash('EJECT!');
+}
+
+function updatePilot(dt) {
+  const running = keys.ShiftLeft || keys.ShiftRight;
+  updateRobot(dt, readWish(), running);
+
+  // Drift the camera back behind the robot while it walks roughly away from us
+  const behind = robot.heading + Math.PI;
+  const off = Math.atan2(Math.sin(behind - orbit.yaw), Math.cos(behind - orbit.yaw));
+  const straight = keys.KeyW && !keys.KeyA && !keys.KeyD;
+  if (straight && robot.speed > 0.5 && Math.abs(off) < Math.PI / 3) orbit.yaw += off * Math.min(1, 1.5 * dt);
+
+  const target = tmp.copy(robotPivot.position).setY(20);
+  const cp = Math.cos(orbit.pitch);
+  camera.position.set(
+    target.x + Math.sin(orbit.yaw) * cp * orbit.dist,
+    Math.max(1.5, target.y + Math.sin(orbit.pitch) * orbit.dist),
+    target.z + Math.cos(orbit.yaw) * cp * orbit.dist);
+  camera.lookAt(target);
+  shake = Math.max(0, shake - dt * 2.5);
+  if (shake > 0) {
+    const k = 0.5 * shake;
+    camera.position.x += (Math.random() - 0.5) * k;
+    camera.position.y += (Math.random() - 0.5) * k;
+  }
+
+  hud.alt.textContent = '0.0';
+  hud.vs.textContent = '0.0';
+  hud.spd.textContent = robot.speed.toFixed(1);
+  if (msgTimer > 0 && (msgTimer -= dt) <= 0) hud.msg.style.opacity = 0;
+}
+
+function updateOnFoot(dt) {
+  updateRobot(dt, NO_INPUT, false);   // let the robot settle to rest
+  readWish();
+
+  const thrusting = keys.Space && fuel > 0;
+  audio.set(thrusting);
+
+  if (onGround && !thrusting) {
+    const sp = keys.ShiftLeft || keys.ShiftRight ? RUN : WALK;
+    vel.x = THREE.MathUtils.damp(vel.x, wish.x * sp, 12, dt);
+    vel.z = THREE.MathUtils.damp(vel.z, wish.z * sp, 12, dt);
+  } else {
+    // Airborne: keep momentum, gentle air control (lander feel)
+    vel.x += wish.x * AIR_ACCEL * dt;
+    vel.z += wish.z * AIR_ACCEL * dt;
+    const drag = Math.exp(-AIR_DRAG * dt);
+    vel.x *= drag; vel.z *= drag;
+  }
+
+  vel.y -= GRAVITY * dt;
+  if (thrusting) {
+    vel.y += THRUST * dt;
+    fuel = Math.max(0, fuel - FUEL_BURN * dt);
+    shake = Math.min(1, shake + dt * 4);
+    if (fuel === 0) flash('FUEL EMPTY');
+  } else {
+    shake = Math.max(0, shake - dt * 4);
+  }
+  if (onGround && !thrusting) fuel = Math.min(1, fuel + FUEL_REFILL * dt);
+
+  // Horizontal move with robot collision
+  move.set(vel.x * dt, 0, vel.z * dt);
+  blockHorizontal(feet, move);
+  feet.x += move.x; feet.z += move.z;
+  if (dt > 0) { vel.x = move.x / dt; vel.z = move.z / dt; }
+
+  // Vertical move & landing
+  const impact = vel.y;
+  feet.y += vel.y * dt;
+  const floor = surfaceHeight(feet);
+  if (feet.y <= floor) {
+    feet.y = floor;
+    if (!onGround && impact < -14) { flash('HARD LANDING'); shake = 1; }
+    vel.y = 0;
+    onGround = true;
+    // Touching down on top of the head climbs into the cockpit
+    if (floor > ROBOT_HEIGHT * 0.9 && reenterCooldown <= 0) { enterRobot(); return; }
+  } else {
+    onGround = feet.y - floor < 0.02 && vel.y <= 0;
+  }
+
+  reenterCooldown -= dt;
+
+  // Keep inside the world
+  const lim = GROUND_SIZE / 2 - 300;
+  feet.x = THREE.MathUtils.clamp(feet.x, -lim, lim);
+  feet.z = THREE.MathUtils.clamp(feet.z, -lim, lim);
+
+  camera.position.set(feet.x, feet.y + EYE_HEIGHT, feet.z);
+  if (shake > 0) {
+    const k = 0.03 * shake;
+    camera.position.x += (Math.random() - 0.5) * k;
+    camera.position.y += (Math.random() - 0.5) * k;
+  }
+
+  // HUD
+  hud.alt.textContent = feet.y.toFixed(1);
+  hud.vs.textContent = vel.y.toFixed(1);
+  hud.spd.textContent = Math.hypot(vel.x, vel.z).toFixed(1);
+  hud.fuel.style.width = (fuel * 100).toFixed(0) + '%';
+  if (msgTimer > 0 && (msgTimer -= dt) <= 0) hud.msg.style.opacity = 0;
+}
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (controls.isLocked) (piloting ? updatePilot : updateOnFoot)(dt);
+  else audio.set(false);
+  // Keep the shadow frustum centred on whatever we're looking at
+  const focus = piloting ? robotPivot.position : feet;
+  sun.target.position.set(focus.x, 0, focus.z);
+  sun.position.copy(sun.target.position).addScaledVector(sunDir, 120);
+  renderer.render(scene, camera);
+});
+
+// ?debug exposes internals for headless testing
+if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, eject, updatePilot, updateOnFoot, feet };
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
