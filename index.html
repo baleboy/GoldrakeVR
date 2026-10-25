@@ -38,11 +38,11 @@
   <div class="keys">
     <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &nbsp;·&nbsp; <kbd>Mouse</kbd>/<kbd>←↑↓→</kbd> look &nbsp;·&nbsp; <kbd>Shift</kbd> run<br>
     <kbd>Space</kbd> jetpack thrusters (hold) &nbsp;·&nbsp; <kbd>R</kbd> rotate robot 90° &nbsp;·&nbsp; <kbd>Esc</kbd> pause<br>
-    Land on Goldrake's head or press <kbd>F</kbd> to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject &nbsp;·&nbsp; <kbd>1</kbd> camera &nbsp;·&nbsp; <kbd>C</kbd> adjust cockpit view
+    Land on Goldrake's head or press <kbd>F</kbd> to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject &nbsp;·&nbsp; <kbd>1</kbd> camera &nbsp;·&nbsp; <kbd>C</kbd> adjust cockpit view &nbsp;·&nbsp; <kbd>H</kbd> haze panel
   </div>
   <div class="keys vr-only" style="display:none">
     VR: left stick move &nbsp;·&nbsp; right stick turn &nbsp;·&nbsp; trigger thrusters &nbsp;·&nbsp; grip run<br>
-    <kbd>A</kbd> pilot &nbsp;·&nbsp; <kbd>B</kbd> camera &nbsp;·&nbsp; <kbd>Y</kbd> eject &nbsp;·&nbsp; <kbd>X</kbd> rotate robot 90° &nbsp;·&nbsp; left stick click: adjust cockpit view
+    <kbd>A</kbd> pilot &nbsp;·&nbsp; <kbd>B</kbd> camera &nbsp;·&nbsp; <kbd>Y</kbd> eject &nbsp;·&nbsp; <kbd>X</kbd> rotate robot 90° &nbsp;·&nbsp; left stick click: adjust cockpit view &nbsp;·&nbsp; right stick click: haze panel
   </div>
   <div class="go">Click to start</div>
 </div>
@@ -108,7 +108,31 @@ const envScene = new THREE.Scene();
 envScene.add(sky.clone());
 scene.environment = pmrem.fromScene(envScene).texture;
 scene.environmentIntensity = 0.6;
-scene.fog = new THREE.Fog(0xb9cbe0, 80, 2200);   // aerial perspective: distance reads as haze
+// Aerial perspective: haze builds up from the first metre (three's squared FogExp2
+// leaves the near ~100 m crystal clear). HAZE_CURVE < 1 front-loads it, so a robot
+// head 30-40 m overhead is visibly veiled (~22%) while the town at a few hundred
+// metres stays readable (~50%). Capped at HAZE_MAX so the distant mountains stay
+// as faint silhouettes instead of vanishing.
+// The three values live in one shared uniform (x density, y curve, z max) so the
+// haze tuning panel can change them live; saved per device like the cockpit fit.
+const HAZE_DEFAULT = { density: 0.0026, curve: 0.5, max: 0.85 };
+const HAZE_KEY = 'goldrake.haze';
+const hazeParams = { value: new THREE.Vector3() };
+function setHaze({ density, curve, max }) { hazeParams.value.set(density, curve, max); }
+try { setHaze({ ...HAZE_DEFAULT, ...JSON.parse(localStorage.getItem(HAZE_KEY)) }); }
+catch { setHaze(HAZE_DEFAULT); }
+THREE.ShaderChunk.fog_pars_fragment += `
+#ifdef USE_FOG
+  uniform vec3 hazeParams;
+#endif`;
+THREE.ShaderChunk.fog_fragment = `
+#ifdef USE_FOG
+  float fogFactor = hazeParams.z * (1.0 - exp(-pow(hazeParams.x * vFogDepth, hazeParams.y)));
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
+#endif`;
+// Hand every material the shared uniform (unused by materials without fog)
+THREE.Material.prototype.onBeforeCompile = (shader) => { shader.uniforms.hazeParams = hazeParams; };
+scene.fog = new THREE.FogExp2(0xb9cbe0);       // only switches fog on; hazeParams drives it
 
 const hemi = new THREE.HemisphereLight(0xcfe4ff, 0x6b5a45, 0.9);
 scene.add(hemi);
@@ -321,35 +345,47 @@ new GLTFLoader().loadAsync('cockpit.glb').then((gltf) => {
 // Tune the cockpit eye point and scale from inside the cockpit (VR or desktop).
 // A head-locked panel shows the values; they're saved to localStorage on this
 // device so they can be read off and baked into COCKPIT_DEFAULT.
+// Head-locked tuning panel (used by cockpit adjust and haze tuning): a canvas
+// texture on a plane just below the line of sight, drawn over everything.
+function makePanel(title) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024; canvas.height = 300;
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.44, 0.13),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, fog: false, toneMapped: false }));
+  mesh.position.set(0, -0.13, -0.6);
+  mesh.renderOrder = 999;
+  mesh.visible = false;
+  camera.add(mesh);
+  return {
+    mesh,
+    draw(values, help) {
+      const g = canvas.getContext('2d');
+      g.clearRect(0, 0, 1024, 300);
+      g.fillStyle = 'rgba(5,10,20,0.8)'; g.beginPath(); g.roundRect(0, 0, 1024, 300, 24); g.fill();
+      g.font = 'bold 40px monospace'; g.fillStyle = '#ffcf3a';
+      g.fillText(title, 32, 60);
+      g.font = '38px monospace'; g.fillStyle = '#fff';
+      g.fillText(values, 32, 125);
+      g.font = '28px monospace'; g.fillStyle = '#9cd';
+      help.forEach((t, i) => g.fillText(t, 32, 190 + i * 44));
+      tex.needsUpdate = true;
+    },
+  };
+}
+
 const adjust = {
   on: false,
   comp: new THREE.Vector3(),   // VR: cancels the physical head offset captured with "use head"
-  canvas: document.createElement('canvas'),
+  panel: makePanel('COCKPIT ADJUST'),
 };
-adjust.canvas.width = 1024; adjust.canvas.height = 300;
-adjust.tex = new THREE.CanvasTexture(adjust.canvas);
-adjust.tex.colorSpace = THREE.SRGBColorSpace;
-adjust.panel = new THREE.Mesh(new THREE.PlaneGeometry(0.44, 0.13),
-  new THREE.MeshBasicMaterial({ map: adjust.tex, transparent: true, depthTest: false, depthWrite: false, fog: false, toneMapped: false }));
-adjust.panel.position.set(0, -0.13, -0.6);
-adjust.panel.renderOrder = 999;
-adjust.panel.visible = false;
-camera.add(adjust.panel);
 
 function drawAdjustPanel() {
-  const g = adjust.canvas.getContext('2d'), { eye, scale } = cockpitFit, f = (v) => v.toFixed(3);
-  g.clearRect(0, 0, 1024, 300);
-  g.fillStyle = 'rgba(5,10,20,0.8)'; g.beginPath(); g.roundRect(0, 0, 1024, 300, 24); g.fill();
-  g.font = 'bold 40px monospace'; g.fillStyle = '#ffcf3a';
-  g.fillText('COCKPIT ADJUST', 32, 60);
-  g.font = '38px monospace'; g.fillStyle = '#fff';
-  g.fillText(`x ${f(eye.x)}  y ${f(eye.y)}  z ${f(eye.z)}  scale ${scale.toFixed(2)}`, 32, 125);
-  g.font = '28px monospace'; g.fillStyle = '#9cd';
-  const help = inVR()
+  const { eye, scale } = cockpitFit, f = (v) => v.toFixed(3);
+  adjust.panel.draw(`x ${f(eye.x)}  y ${f(eye.y)}  z ${f(eye.z)}  scale ${scale.toFixed(2)}`, inVR()
     ? ['L-stick: forward/side · R-stick: up/down (Y), scale (X)', 'A: use current head position · B: reset · L-stick click: done']
-    : ['I/K forward/back · J/L side · U/O up/down · [ ] scale', '0: reset · C: done'];
-  help.forEach((t, i) => g.fillText(t, 32, 190 + i * 44));
-  adjust.tex.needsUpdate = true;
+    : ['I/K forward/back · J/L side · U/O up/down · [ ] scale', '0: reset · C: done']);
 }
 
 function saveCockpitFit() {
@@ -361,7 +397,8 @@ function saveCockpitFit() {
 function toggleAdjust() {
   if (!adjust.on && !(piloting && cam().cockpit)) { flash('Switch to the cockpit camera to adjust it'); return; }
   adjust.on = !adjust.on;
-  adjust.panel.visible = adjust.on;
+  adjust.panel.mesh.visible = adjust.on;
+  if (adjust.on && hazeTune.on) toggleHaze();   // one panel at a time
   if (adjust.on) drawAdjustPanel();
   else {
     const { eye, scale } = cockpitFit;
@@ -404,6 +441,64 @@ function resetCockpitFit() {
 function updateAdjustDesktop(dt) {
   const k = (c) => keys[c] ? 1 : 0;
   nudgeCockpit(k('KeyI') - k('KeyK'), k('KeyL') - k('KeyJ'), k('KeyU') - k('KeyO'), k('BracketRight') - k('BracketLeft'), dt);
+}
+
+// ---------- haze tuning ----------
+// Live haze controls while you keep moving around (H on desktop, right stick
+// click in VR). Values are saved per device; bake them into HAZE_DEFAULT.
+const hazeTune = { on: false, panel: makePanel('HAZE') };
+
+function drawHazePanel() {
+  const { x: density, y: curve, z: max } = hazeParams.value;
+  // haze at the robot's head (~35 m) and at the town (~300 m) for reference
+  const at = (d) => Math.round(100 * max * (1 - Math.exp(-Math.pow(density * d, curve))));
+  hazeTune.panel.draw(hazeValues(), [
+    `haze at robot head (35 m) ${at(35)}% · at the town (300 m) ${at(300)}%`,
+    ...(inVR()
+      ? ['R-stick: density ↑↓, curve ←→ · A/B: max -/+', 'B+A: reset · R-stick click: done (you can still move)']
+      : ['Z/X density -/+ · V/B curve -/+ · N/M max -/+', '0: reset · H: done (you can still move)']),
+  ]);
+}
+const hazeValues = () => {
+  const { x: density, y: curve, z: max } = hazeParams.value;
+  return `density ${density.toFixed(4)}  curve ${curve.toFixed(2)}  max ${max.toFixed(2)}`;
+};
+
+function toggleHaze() {
+  hazeTune.on = !hazeTune.on;
+  hazeTune.panel.mesh.visible = hazeTune.on;
+  if (hazeTune.on && adjust.on) toggleAdjust();  // one panel at a time
+  if (hazeTune.on) drawHazePanel();
+  else console.log('haze', hazeValues());
+}
+
+// dDensity scales density exponentially (x2 per second at full deflection)
+const HAZE_CURVE_RATE = 0.4, HAZE_MAX_RATE = 0.3;   // per second
+function nudgeHaze(dDensity, dCurve, dMax, dt) {
+  if (!dDensity && !dCurve && !dMax) return;
+  const { x: density, y: curve, z: max } = hazeParams.value;
+  setHaze({
+    density: THREE.MathUtils.clamp(density * Math.pow(2, dDensity * dt), 0.0001, 0.1),
+    curve: THREE.MathUtils.clamp(curve + dCurve * HAZE_CURVE_RATE * dt, 0.2, 2),
+    max: THREE.MathUtils.clamp(max + dMax * HAZE_MAX_RATE * dt, 0, 1),
+  });
+  saveHaze();
+}
+
+function saveHaze() {
+  const { x: density, y: curve, z: max } = hazeParams.value;
+  try { localStorage.setItem(HAZE_KEY, JSON.stringify({ density, curve, max })); } catch {}
+  drawHazePanel();
+}
+
+function resetHaze() {
+  setHaze(HAZE_DEFAULT);
+  saveHaze();
+}
+
+function updateHazeDesktop(dt) {
+  const k = (c) => keys[c] ? 1 : 0;
+  nudgeHaze(k('KeyX') - k('KeyZ'), k('KeyB') - k('KeyV'), k('KeyM') - k('KeyN'), dt);
 }
 
 // goldrake_anim.glb carries the rig and clips; goldrake.glb shares its UV layout
@@ -502,6 +597,8 @@ addEventListener('keydown', (e) => {
   if (e.code === 'Digit1') actions.camera();
   if (e.code === 'KeyC') toggleAdjust();
   if (e.code === 'Digit0' && adjust.on) resetCockpitFit();
+  if (e.code === 'KeyH') toggleHaze();
+  if (e.code === 'Digit0' && hazeTune.on) resetHaze();
 });
 addEventListener('keyup', (e) => keys[e.code] = false);
 
@@ -534,12 +631,13 @@ function pollVR(dt) {
     if (h === 'left') {
       vr.moveX = dz(sx); vr.moveY = dz(sy);
       pressed.X = b(4); pressed.Y = b(5); pressed.LS = b(3);
-    } else if (adjust.on && h === 'right') {
-      pressed.A = b(4); pressed.B = b(5);
+    } else if ((adjust.on || hazeTune.on) && h === 'right') {
+      if (hazeTune.on && b(0)) vr.thrust = true;   // keep flying around while tuning haze
+      pressed.A = b(4); pressed.B = b(5); pressed.RS = b(3);
       rsx = dz(sx); rsy = dz(sy);
     } else if (h === 'right') {
       if (b(0)) vr.thrust = true;
-      pressed.A = b(4); pressed.B = b(5);
+      pressed.A = b(4); pressed.B = b(5); pressed.RS = b(3);
       // Snap turn: one step per flick, re-armed once the stick returns to centre
       if (vr.turnArmed && Math.abs(sx) > 0.7) { look(Math.sign(sx) * VR_SNAP, 0); vr.turnArmed = false; }
       else if (Math.abs(sx) < 0.3) vr.turnArmed = true;
@@ -548,11 +646,18 @@ function pollVR(dt) {
   }
   // Adjust mode: left stick moves the eye forward/side, right stick up/down and scale
   if (adjust.on) nudgeCockpit(-vr.moveY, vr.moveX, -rsy, rsx, dt);
+  // Haze tuning: right stick density/curve, hold A/B for max -/+, both together reset
+  if (hazeTune.on && !(pressed.A && pressed.B)) nudgeHaze(-rsy, rsx, (pressed.B ? 1 : 0) - (pressed.A ? 1 : 0), dt);
   const edge = (k) => pressed[k] && !vr.prev[k];
   if (edge('LS')) toggleAdjust();
+  else if (edge('RS')) toggleHaze();
   else if (adjust.on) {
     if (edge('A')) captureHead();
     if (edge('B')) resetCockpitFit();
+  } else if (hazeTune.on) {
+    if (pressed.A && pressed.B && (edge('A') || edge('B'))) resetHaze();
+    if (edge('Y')) actions.eject();
+    if (edge('X')) actions.rotate();
   } else {
     if (edge('A')) actions.board();
     if (edge('B')) actions.camera();
@@ -1068,6 +1173,7 @@ renderer.setAnimationLoop(() => {
   else if (controls.isLocked) {
     arrowLook(dt);
     if (adjust.on) updateAdjustDesktop(dt);
+    if (hazeTune.on) updateHazeDesktop(dt);
     (piloting ? updatePilot : updateOnFoot)(dt);
   }
   else audio.set(false);
@@ -1087,7 +1193,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // ?debug exposes internals for headless testing
-if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, toggleAdjust, nudgeCockpit, eject, updatePilot, updateOnFoot, feet, camera, robotPivot };
+if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, toggleAdjust, nudgeCockpit, toggleHaze, nudgeHaze, eject, updatePilot, updateOnFoot, feet, camera, robotPivot };
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
