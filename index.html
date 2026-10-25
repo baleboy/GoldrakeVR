@@ -285,6 +285,25 @@ function calibrate(action, feetBones) {
   return { dur, speed: travel / dur, strikes };
 }
 
+// Cockpit interior for the first-person pilot view. The model is a pilot's-eye
+// set (arms, legs, console) facing -Z; COCKPIT_EYE is the eye point in model units.
+const COCKPIT_SCALE = 0.8, COCKPIT_EYE = new THREE.Vector3(0, 0.3, 0.75);
+const cockpit = new THREE.Group();               // origin = pilot's eye, faces -Z
+cockpit.visible = false;
+scene.add(cockpit);
+// While in the cockpit, cut the robot off above the neck so its head doesn't
+// enclose the view (the negative side of the plane, y > constant, is clipped)
+const headClip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
+renderer.localClippingEnabled = true;
+// Loaded on its own so it doesn't hold up the start screen
+new GLTFLoader().loadAsync('cockpit.glb').then((gltf) => {
+  const m = gltf.scene;
+  m.scale.setScalar(COCKPIT_SCALE);
+  m.position.copy(COCKPIT_EYE).multiplyScalar(-COCKPIT_SCALE);
+  m.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+  cockpit.add(m);
+}).catch((err) => console.error('cockpit.glb failed to load', err));
+
 // goldrake_anim.glb carries the rig and clips; goldrake.glb shares its UV layout
 // but has the proper baked colour + metal/roughness maps, so we borrow its material.
 const loadProgress = {};
@@ -313,6 +332,7 @@ Promise.all([loadGLB('goldrake_anim.glb'), loadGLB('goldrake.glb')]).then(([gltf
   orig.scene.traverse((o) => { if (o.isMesh) mat = o.material; });
   skinned.material.dispose();
   skinned.material = mat;
+  mat.clippingPlanes = [headClip];
   for (const t of [mat.map, mat.metalnessMap]) if (t) t.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
   // Bake the rest pose into a plain mesh for collisions
@@ -338,6 +358,7 @@ Promise.all([loadGLB('goldrake_anim.glb'), loadGLB('goldrake.glb')]).then(([gltf
     const feetBones = [bone('LeftFoot'), bone('RightFoot')];
     anim.feet = feetBones;
     anim.eye = bone('headfront') || bone('Head');
+    anim.neck = bone('Neck');
     anim.walkCal = calibrate(anim.walk, feetBones);
     anim.runCal = calibrate(anim.run, feetBones);
     mixer.update(0);
@@ -432,7 +453,7 @@ const CAM_MODES = [
   { name: 'CHASE CAM', fov: 50, near: 0.1, dist: 34, pitch: 0.08, minPitch: 0.02, pivotY: 3, targetY: 15, shoulder: 6, aim: 2.5, lag: 1.5 },
   { name: 'ORBIT CAM', fov: 70, near: 0.1, dist: 58, pitch: 0.28, minPitch: 0.02, pivotY: 20, targetY: 20, shoulder: 0, aim: 0, lag: 0 },
   // near plane clips away the inside of the head around the eye point
-  { name: 'COCKPIT', fov: 75, near: 1.5, cockpit: true },
+  { name: 'COCKPIT', fov: 75, near: 0.05, cockpit: true },
   { name: 'SHOULDER CAM', fov: 55, near: 0.1, dist: 11, pitch: 0.12, minPitch: -0.3, pivotY: 27, targetY: 26.5, shoulder: 0, aim: 0, lag: 3 },
   // same framing shifted sideways and looking straight ahead, so the robot sits
   // to one side and the path in front stays clear
@@ -452,7 +473,13 @@ function setCamMode(i) {
   chase.eyeY = null;
   camera.near = cam().near;
   camera.updateProjectionMatrix();
+  showCockpit(!!cam().cockpit);
   flash(cam().name);
+}
+
+function showCockpit(on) {
+  cockpit.visible = on;
+  if (!on) headClip.constant = 1e6;
 }
 
 // Turn the view by (dx, dy) radians the way the mouse does: dx > 0 looks right, dy > 0 looks down
@@ -731,6 +758,7 @@ function eject() {
   piloting = false;
   camera.near = 0.1;
   camera.updateProjectionMatrix();
+  showCockpit(false);
   document.body.classList.remove('piloting');
   updateRobotBox();
   const back = new THREE.Vector3(-Math.sin(robot.heading), 0, -Math.cos(robot.heading));
@@ -764,12 +792,15 @@ function updatePilot(dt) {
 
   if (m.cockpit) {
     // Eye at the front of the head; the mocap head motion supplies the gait bob
-    anim.eye.getWorldPosition(camera.position);
-    camera.position.y += chase.bob * 0.3;
+    const eye = anim.eye.getWorldPosition(cockpit.position);
     if (inVR()) {                             // ...softened in VR
-      chase.eyeY = chase.eyeY === null ? camera.position.y : THREE.MathUtils.damp(chase.eyeY, camera.position.y, 3, dt);
-      camera.position.y = chase.eyeY;
+      chase.eyeY = chase.eyeY === null ? eye.y : THREE.MathUtils.damp(chase.eyeY, eye.y, 3, dt);
+      eye.y = chase.eyeY;
     }
+    cockpit.rotation.y = robot.heading + Math.PI;
+    headClip.constant = anim.neck.getWorldPosition(tmp).y;
+    camera.position.copy(eye);
+    camera.position.y += chase.bob * 0.3;     // the pilot sways a little inside the cockpit
     camEuler.set(cockpitLook.pitch, robot.heading + Math.PI + cockpitLook.yaw, chase.roll * 0.5);
     camera.quaternion.setFromEuler(camEuler);
   } else {
@@ -933,7 +964,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // ?debug exposes internals for headless testing
-if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, eject, updatePilot, updateOnFoot, feet };
+if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, eject, updatePilot, updateOnFoot, feet };
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
