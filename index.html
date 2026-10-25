@@ -554,7 +554,12 @@ Promise.all([loadGLB('goldrake_anim.glb'), loadGLB('goldrake.glb')]).then(([gltf
     const bone = (suffix) => { let f = null; model.traverse((o) => { if (o.isBone && o.name.endsWith(suffix)) f = o; }); return f; };
     const feetBones = [bone('LeftFoot'), bone('RightFoot')];
     anim.feet = feetBones;
-    anim.eye = bone('headfront') || bone('Head');
+    // Cockpit eye point: headfront's height, but pulled back from the face to the
+    // middle of the head (the head mesh spans z -13.2..6.6 in Head bone space)
+    const head = bone('Head'), front = bone('headfront');
+    anim.eye = new THREE.Object3D();
+    anim.eye.position.set(front ? front.position.x : 0, front ? front.position.y : 0, -3.3);
+    head.add(anim.eye);
     anim.neck = bone('Neck');
     anim.walkCal = calibrate(anim.walk, feetBones);
     anim.runCal = calibrate(anim.run, feetBones);
