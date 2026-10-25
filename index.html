@@ -1087,7 +1087,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // ?debug exposes internals for headless testing
-if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, toggleAdjust, nudgeCockpit, eject, updatePilot, updateOnFoot, feet };
+if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, toggleAdjust, nudgeCockpit, eject, updatePilot, updateOnFoot, feet, camera, robotPivot };
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
