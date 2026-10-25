@@ -38,11 +38,11 @@
   <div class="keys">
     <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &nbsp;·&nbsp; <kbd>Mouse</kbd>/<kbd>←↑↓→</kbd> look &nbsp;·&nbsp; <kbd>Shift</kbd> run<br>
     <kbd>Space</kbd> jetpack thrusters (hold) &nbsp;·&nbsp; <kbd>R</kbd> rotate robot 90° &nbsp;·&nbsp; <kbd>Esc</kbd> pause<br>
-    Land on Goldrake's head or press <kbd>F</kbd> to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject &nbsp;·&nbsp; <kbd>1</kbd> camera
+    Land on Goldrake's head or press <kbd>F</kbd> to pilot it &nbsp;·&nbsp; <kbd>E</kbd> eject &nbsp;·&nbsp; <kbd>1</kbd> camera &nbsp;·&nbsp; <kbd>C</kbd> adjust cockpit view
   </div>
   <div class="keys vr-only" style="display:none">
     VR: left stick move &nbsp;·&nbsp; right stick turn &nbsp;·&nbsp; trigger thrusters &nbsp;·&nbsp; grip run<br>
-    <kbd>A</kbd> pilot &nbsp;·&nbsp; <kbd>B</kbd> camera &nbsp;·&nbsp; <kbd>Y</kbd> eject &nbsp;·&nbsp; <kbd>X</kbd> rotate robot 90°
+    <kbd>A</kbd> pilot &nbsp;·&nbsp; <kbd>B</kbd> camera &nbsp;·&nbsp; <kbd>Y</kbd> eject &nbsp;·&nbsp; <kbd>X</kbd> rotate robot 90° &nbsp;·&nbsp; left stick click: adjust cockpit view
   </div>
   <div class="go">Click to start</div>
 </div>
@@ -286,8 +286,22 @@ function calibrate(action, feetBones) {
 }
 
 // Cockpit interior for the first-person pilot view. The model is a pilot's-eye
-// set (arms, legs, console) facing -Z; COCKPIT_EYE is the eye point in model units.
-const COCKPIT_SCALE = 0.8, COCKPIT_EYE = new THREE.Vector3(0, 0.3, 0.75);
+// set (arms, legs, console) facing -Z; `eye` is the eye point in model units.
+// Cockpit adjust mode (below) can override the defaults, saved per device.
+const COCKPIT_DEFAULT = { x: 0, y: 0.3, z: 0.75, scale: 0.8 };
+const COCKPIT_KEY = 'goldrake.cockpitFit';
+const cockpitFit = { eye: new THREE.Vector3(), scale: 1 };
+function setCockpitFit({ x, y, z, scale }) {
+  cockpitFit.eye.set(x, y, z);
+  cockpitFit.scale = scale;
+  if (cockpitModel) {
+    cockpitModel.scale.setScalar(scale);
+    cockpitModel.position.copy(cockpitFit.eye).multiplyScalar(-scale);
+  }
+}
+let cockpitModel = null;
+try { setCockpitFit({ ...COCKPIT_DEFAULT, ...JSON.parse(localStorage.getItem(COCKPIT_KEY)) }); }
+catch { setCockpitFit(COCKPIT_DEFAULT); }
 const cockpit = new THREE.Group();               // origin = pilot's eye, faces -Z
 cockpit.visible = false;
 scene.add(cockpit);
@@ -297,12 +311,100 @@ const headClip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
 renderer.localClippingEnabled = true;
 // Loaded on its own so it doesn't hold up the start screen
 new GLTFLoader().loadAsync('cockpit.glb').then((gltf) => {
-  const m = gltf.scene;
-  m.scale.setScalar(COCKPIT_SCALE);
-  m.position.copy(COCKPIT_EYE).multiplyScalar(-COCKPIT_SCALE);
-  m.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
-  cockpit.add(m);
+  cockpitModel = gltf.scene;
+  cockpitModel.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+  setCockpitFit({ ...cockpitFit.eye, scale: cockpitFit.scale });
+  cockpit.add(cockpitModel);
 }).catch((err) => console.error('cockpit.glb failed to load', err));
+
+// ---------- cockpit adjust mode ----------
+// Tune the cockpit eye point and scale from inside the cockpit (VR or desktop).
+// A head-locked panel shows the values; they're saved to localStorage on this
+// device so they can be read off and baked into COCKPIT_DEFAULT.
+const adjust = {
+  on: false,
+  comp: new THREE.Vector3(),   // VR: cancels the physical head offset captured with "use head"
+  canvas: document.createElement('canvas'),
+};
+adjust.canvas.width = 1024; adjust.canvas.height = 300;
+adjust.tex = new THREE.CanvasTexture(adjust.canvas);
+adjust.tex.colorSpace = THREE.SRGBColorSpace;
+adjust.panel = new THREE.Mesh(new THREE.PlaneGeometry(0.44, 0.13),
+  new THREE.MeshBasicMaterial({ map: adjust.tex, transparent: true, depthTest: false, depthWrite: false, fog: false, toneMapped: false }));
+adjust.panel.position.set(0, -0.13, -0.6);
+adjust.panel.renderOrder = 999;
+adjust.panel.visible = false;
+camera.add(adjust.panel);
+
+function drawAdjustPanel() {
+  const g = adjust.canvas.getContext('2d'), { eye, scale } = cockpitFit, f = (v) => v.toFixed(3);
+  g.clearRect(0, 0, 1024, 300);
+  g.fillStyle = 'rgba(5,10,20,0.8)'; g.beginPath(); g.roundRect(0, 0, 1024, 300, 24); g.fill();
+  g.font = 'bold 40px monospace'; g.fillStyle = '#ffcf3a';
+  g.fillText('COCKPIT ADJUST', 32, 60);
+  g.font = '38px monospace'; g.fillStyle = '#fff';
+  g.fillText(`x ${f(eye.x)}  y ${f(eye.y)}  z ${f(eye.z)}  scale ${scale.toFixed(2)}`, 32, 125);
+  g.font = '28px monospace'; g.fillStyle = '#9cd';
+  const help = inVR()
+    ? ['L-stick: forward/side · R-stick: up/down (Y), scale (X)', 'A: use current head position · B: reset · L-stick click: done']
+    : ['I/K forward/back · J/L side · U/O up/down · [ ] scale', '0: reset · C: done'];
+  help.forEach((t, i) => g.fillText(t, 32, 190 + i * 44));
+  adjust.tex.needsUpdate = true;
+}
+
+function saveCockpitFit() {
+  const { eye, scale } = cockpitFit;
+  try { localStorage.setItem(COCKPIT_KEY, JSON.stringify({ x: eye.x, y: eye.y, z: eye.z, scale })); } catch {}
+  drawAdjustPanel();
+}
+
+function toggleAdjust() {
+  if (!adjust.on && !(piloting && cam().cockpit)) { flash('Switch to the cockpit camera to adjust it'); return; }
+  adjust.on = !adjust.on;
+  adjust.panel.visible = adjust.on;
+  if (adjust.on) drawAdjustPanel();
+  else {
+    const { eye, scale } = cockpitFit;
+    console.log('cockpit fit', JSON.stringify({ x: +eye.x.toFixed(3), y: +eye.y.toFixed(3), z: +eye.z.toFixed(3), scale: +scale.toFixed(2) }));
+  }
+}
+
+// Nudge in cockpit space: fwd > 0 moves the eye forward (-Z), side > 0 right, up > 0 up
+const ADJUST_RATE = 0.15, ADJUST_SCALE_RATE = 0.15;   // model units/s, scale/s
+function nudgeCockpit(fwd, side, up, grow, dt) {
+  if (!fwd && !side && !up && !grow) return;
+  const { eye, scale } = cockpitFit;
+  setCockpitFit({
+    x: eye.x + side * ADJUST_RATE * dt,
+    y: eye.y + up * ADJUST_RATE * dt,
+    z: eye.z - fwd * ADJUST_RATE * dt,
+    scale: THREE.MathUtils.clamp(scale + grow * ADJUST_SCALE_RATE * dt, 0.3, 3),
+  });
+  saveCockpitFit();
+}
+
+// VR: make wherever the head is now the eye point. The rig is shifted back by the
+// same offset so the view doesn't jump.
+function captureHead() {
+  const h = camera.position;                 // headset pose relative to the rig
+  const local = tmp.set(h.x, h.y, h.z).applyAxisAngle(THREE.Object3D.DEFAULT_UP, cockpitLook.yaw);
+  const { eye, scale } = cockpitFit;
+  setCockpitFit({ x: eye.x + local.x / scale, y: eye.y + local.y / scale, z: eye.z + local.z / scale, scale });
+  adjust.comp.copy(h).negate();
+  saveCockpitFit();
+  flash('Head position captured');
+}
+
+function resetCockpitFit() {
+  setCockpitFit(COCKPIT_DEFAULT);
+  adjust.comp.set(0, 0, 0);
+  saveCockpitFit();
+}
+
+function updateAdjustDesktop(dt) {
+  const k = (c) => keys[c] ? 1 : 0;
+  nudgeCockpit(k('KeyI') - k('KeyK'), k('KeyL') - k('KeyJ'), k('KeyU') - k('KeyO'), k('BracketRight') - k('BracketLeft'), dt);
+}
 
 // goldrake_anim.glb carries the rig and clips; goldrake.glb shares its UV layout
 // but has the proper baked colour + metal/roughness maps, so we borrow its material.
@@ -398,6 +500,8 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyE') actions.eject();
   if (e.code === 'KeyF') actions.board();
   if (e.code === 'Digit1') actions.camera();
+  if (e.code === 'KeyC') toggleAdjust();
+  if (e.code === 'Digit0' && adjust.on) resetCockpitFit();
 });
 addEventListener('keyup', (e) => keys[e.code] = false);
 
@@ -419,6 +523,7 @@ function pollVR(dt) {
   const session = renderer.xr.getSession();
   if (!session) return;
   const pressed = {};
+  let rsx = 0, rsy = 0;
   for (const src of session.inputSources) {
     const gp = src.gamepad;
     if (!gp) continue;
@@ -428,7 +533,10 @@ function pollVR(dt) {
     if (b(1)) vr.run = true;
     if (h === 'left') {
       vr.moveX = dz(sx); vr.moveY = dz(sy);
-      pressed.X = b(4); pressed.Y = b(5);
+      pressed.X = b(4); pressed.Y = b(5); pressed.LS = b(3);
+    } else if (adjust.on && h === 'right') {
+      pressed.A = b(4); pressed.B = b(5);
+      rsx = dz(sx); rsy = dz(sy);
     } else if (h === 'right') {
       if (b(0)) vr.thrust = true;
       pressed.A = b(4); pressed.B = b(5);
@@ -438,11 +546,19 @@ function pollVR(dt) {
       if (piloting && !cam().cockpit) look(0, dz(sy) * 1.2 * dt);
     }
   }
+  // Adjust mode: left stick moves the eye forward/side, right stick up/down and scale
+  if (adjust.on) nudgeCockpit(-vr.moveY, vr.moveX, -rsy, rsx, dt);
   const edge = (k) => pressed[k] && !vr.prev[k];
-  if (edge('A')) actions.board();
-  if (edge('B')) actions.camera();
-  if (edge('Y')) actions.eject();
-  if (edge('X')) actions.rotate();
+  if (edge('LS')) toggleAdjust();
+  else if (adjust.on) {
+    if (edge('A')) captureHead();
+    if (edge('B')) resetCockpitFit();
+  } else {
+    if (edge('A')) actions.board();
+    if (edge('B')) actions.camera();
+    if (edge('Y')) actions.eject();
+    if (edge('X')) actions.rotate();
+  }
   vr.prev = pressed;
 }
 
@@ -480,6 +596,7 @@ function setCamMode(i) {
 function showCockpit(on) {
   cockpit.visible = on;
   if (!on) headClip.constant = 1e6;
+  if (!on && adjust.on) toggleAdjust();
 }
 
 // Turn the view by (dx, dy) radians the way the mouse does: dx > 0 looks right, dy > 0 looks down
@@ -774,7 +891,7 @@ function eject() {
 
 function updatePilot(dt) {
   const running = keys.ShiftLeft || keys.ShiftRight || vr.run;
-  updateRobot(dt, readWish(), running);
+  updateRobot(dt, adjust.on ? NO_INPUT : readWish(), running);   // hold still while adjusting
 
   const m = cam();
 
@@ -914,7 +1031,7 @@ function syncRig() {
   const p = camera.position, t = chase.target;
   let yaw = vrYaw;
   if (piloting) yaw = cam().cockpit ? robot.heading + Math.PI + cockpitLook.yaw : Math.atan2(p.x - t.x, p.z - t.z);
-  rig.position.copy(p);
+  rig.position.copy(p).add(tmp.copy(adjust.comp).applyAxisAngle(THREE.Object3D.DEFAULT_UP, yaw));
   rig.rotation.set(0, yaw, 0);
 }
 
@@ -931,6 +1048,8 @@ renderer.xr.addEventListener('sessionstart', () => {
   lookEuler.setFromQuaternion(camera.quaternion);
   vrYaw = lookEuler.y;
   chase.eyeY = null;
+  adjust.comp.set(0, 0, 0);                    // fresh reference space, no head offset to cancel
+  renderer.xr.getReferenceSpace()?.addEventListener('reset', () => adjust.comp.set(0, 0, 0));
   controls.unlock();
   overlay.style.display = 'none';
 });
@@ -946,7 +1065,11 @@ renderer.xr.addEventListener('sessionend', () => {
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (inVR()) { pollVR(dt); (piloting ? updatePilot : updateOnFoot)(dt); syncRig(); }
-  else if (controls.isLocked) { arrowLook(dt); (piloting ? updatePilot : updateOnFoot)(dt); }
+  else if (controls.isLocked) {
+    arrowLook(dt);
+    if (adjust.on) updateAdjustDesktop(dt);
+    (piloting ? updatePilot : updateOnFoot)(dt);
+  }
   else audio.set(false);
   updateDust(dt);
   // Narrow lens while piloting flattens perspective, like filming something huge from afar
@@ -964,7 +1087,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // ?debug exposes internals for headless testing
-if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, eject, updatePilot, updateOnFoot, feet };
+if (location.search.includes('debug')) window.gk = { orbit, keys, robot, anim, enterRobot, setCamMode, cockpit, cockpitLook, toggleAdjust, nudgeCockpit, eject, updatePilot, updateOnFoot, feet };
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
